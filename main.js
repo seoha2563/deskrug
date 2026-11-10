@@ -106,14 +106,26 @@ ipcMain.on('set-shape', (_e, r) => {
 });
 ipcMain.on('save-pos', (_e, p) => { settings.pos = p; saveSettings(); });
 ipcMain.on('log', (_e, m) => console.log('[renderer]', m));
+// 처음 실행할 때 한 번만 묻는다. 사용자가 직접 "자동 실행하기"를 눌러야만 시작 프로그램에 등록된다.
+async function askAutostart() {
+  const { response } = await dialog.showMessageBox({
+    type: 'question', title: 'DeskRug', buttons: ['자동 실행하기', '나중에'], defaultId: 1, cancelId: 1, noLink: true,
+    message: '컴퓨터를 켤 때마다 DeskRug를 자동으로 실행할까요?',
+    detail: '나중에 작업표시줄 오른쪽 아래 러그 모양 아이콘 메뉴에서 언제든 바꿀 수 있어요.\nDeskRug 폴더를 옮기거나 지우면 자동 실행이 끊겨요.',
+  });
+  if (response !== 0) return;
+  settings.autostart = true; saveSettings();
+  app.setLoginItemSettings({ openAtLogin: true });
+}
 ipcMain.on('renderer-ready', () => {
   rendererReady = true;
   send({ type: 'init', settings, image: settings.image ? imageDataUrl(settings.image) : null });
   if (settings.firstRun && !SELFTEST) {
     settings.firstRun = false; saveSettings();
     if (Notification.isSupported()) {
-      new Notification({ title: 'DeskRug', body: '러그를 바탕화면에 깔았어요. 열려 있는 창을 최소화하면 보여요. 설정은 작업표시줄 오른쪽 아래의 러그 모양 아이콘에서 바꿀 수 있어요.' }).show();
+      new Notification({ title: 'DeskRug', body: '러그를 바탕화면에 깔았습니다. 열려 있는 창을 최소화하면 보입니다. 설정은 작업표시줄 오른쪽 아래의 러그 모양 아이콘에서 바꿀 수 있습니다. ^^' }).show();
     }
+    if (app.isPackaged) askAutostart();
   }
   if (SELFTEST) runSelfTest();
 });
