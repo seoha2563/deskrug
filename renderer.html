@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;">
+<title>DeskRug</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+  #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  body.dragging, body.dragging * { cursor: grabbing !important; }
+  body.rug-grab, body.rug-grab * { cursor: grab !important; }
+  body.rug-move, body.rug-move * { cursor: move !important; }
+  #ui { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div id="bar"><button id="btnOpen"></button><span id="vSize"></span><input id="size" type="range" min="100" max="500" value="300"><button id="btnFlat"></button><button id="fab"></button><button id="share"></button></div>
+  <div id="panel"><button id="btnClose"></button><button id="btnDefault"></button>
+    <input id="bgRemove" type="checkbox"><input id="bgTol" type="range" min="5" max="120" value="40"><span id="vTol"></span>
+    <input id="stiff" type="range" min="5" max="90" value="35"><span id="vStiff"></span><input id="moveMode" type="checkbox"></div>
+  <input id="file" type="file"><div id="toast"></div><div id="drop"></div>
+</div>
+<script src="cloth.js"></script>
+<script src="rug-default.js"></script>
+<script>
+'use strict';
+let wakeUntil = 0;
+const wake = (ms = 2500) => { wakeUntil = Math.max(wakeUntil, performance.now() + ms); };
+const $ = id => document.getElementById(id);
+const canvas = $('c');
+const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: true, antialias: true, depth: true });
+if (!gl) document.body.insertAdjacentHTML('beforeend', '<p style="position:fixed;inset:auto 16px 70px 16px;z-index:300;background:#fff3cd;color:#664d03;padding:12px 16px;border-radius:8px">WebGL2를 지원하지 않는 환경입니다.</p>');
+
+/* ---------------------------------------------------------------- shaders */
+const VS = `#version 300 es
+precision highp float;
+in vec2  a_uv;
+in vec3  a_pos;      // 시뮬레이션 결과 위치 (러그 로컬 px, z = 높이)
+in vec3  a_nrm;
+in float a_ao;
+uniform vec2  u_origin, u_view, u_tap;
+uniform float u_pass;
+out vec2  v_uv;
+out vec3  v_n;
+out float v_ao;
+void main() {
+  vec3 q = a_pos;
+  v_uv = a_uv; v_n = a_nrm; v_ao = a_ao;
+  vec2 s;
+  if (u_pass < 0.5) s = u_origin + q.xy + vec2(4.0, 7.0) + u_tap + vec2(0.45, 0.7) * q.z;   // 그림자
+  else              s = u_origin + q.xy + vec2(0.12, -0.45) * q.z;                          // 본체
+  gl_Position = vec4(s.x / u_view.x * 2.0 - 1.0, 1.0 - s.y / u_view.y * 2.0,
+                     clamp(-q.z / 500.0, -0.99, 0.99), 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec2  v_uv;
+in vec3  v_n;
+in float v_ao;
+uniform sampler2D u_tex;
+uniform float u_pass, u_shadowA, u_backDark;
+out vec4 o;
+void main() {
+  vec4 c = texture(u_tex, v_uv);            // 프리멀티플라이드 알파
+  if (c.a < 0.02) discard;
+  if (u_pass < 0.5) { o = vec4(0.0, 0.0, 0.0, c.a * u_shadowA); return; }
+
+  vec3 n = normalize(v_n);
+  bool back = n.z < 0.0;
+  vec3 nv = back ? -n : n;
+  vec3 L = normalize(vec3(-0.35, -0.55, 0.75));
+  float diff = max(dot(nv, L), 0.0);
+  float spec = pow(max(dot(nv, normalize(L + vec3(0.0, 0.0, 1.0))), 0.0), 28.0) * 0.05;
+  float ao = clamp(v_ao * 0.4, 0.0, 0.7) * 0.6;      // 다른 천 아래/주름 사이는 어둡게
+  float shade = (0.42 + 0.78 * diff) * (1.0 - ao);
+
+  vec3 rgb = c.rgb;
+  if (back) {                               // 러그 뒷면: 어둡고 살짝 탈색
+    float lum = dot(rgb, vec3(0.3, 0.59, 0.11));
+    rgb = mix(rgb, vec3(lum), 0.3) * u_backDark;
+  }
+  o = vec4(clamp(rgb * shade + spec * c.a, 0.0, 1.0), c.a);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+const U = {};
+for (const n of ['u_origin','u_view','u_tap','u_pass','u_tex','u_shadowA','u_backDark']) U[n] = gl.getUniformLocation(prog, n);
+
+/* ------------------------------------------------------- mesh (from cloth) */
+let cloth = null, indexCount = 0;
+const vao = gl.createVertexArray();
+const vboUV = gl.createBuffer(), vboPos = gl.createBuffer(), vboNrm = gl.createBuffer(), vboAO = gl.createBuffer(), ibo = gl.createBuffer();
+
+function attr(name, buf, size, usage, data) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, data, usage);
+  const l = gl.getAttribLocation(prog, name); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, size, gl.FLOAT, false, 0, 0);
+}
+function buildCloth() {
+  wake();
+  cloth = new Cloth(rugW, rugH, { bend: +$('stiff').value / 100 });
+  cloth.setAlphaFn(maskAlpha);
+  const { nx, ny, n } = cloth;
+  const uvs = new Float32Array(n * 2);
+  for (let j = 0, k = 0; j < ny; j++) for (let i = 0; i < nx; i++) { uvs[k++] = i / (nx - 1); uvs[k++] = j / (ny - 1); }
+  const idx = new Uint32Array((nx - 1) * (ny - 1) * 6);
+  for (let j = 0, k = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
+    const a = j * nx + i, b = a + 1, c = a + nx, d = c + 1;
+    idx.set([a, c, b, b, c, d], k); k += 6;
+  }
+  indexCount = idx.length;
+  gl.bindVertexArray(vao);
+  attr('a_uv', vboUV, 2, gl.STATIC_DRAW, uvs);
+  attr('a_pos', vboPos, 3, gl.DYNAMIC_DRAW, cloth.pos);
+  attr('a_nrm', vboNrm, 3, gl.DYNAMIC_DRAW, cloth.nrm);
+  attr('a_ao', vboAO, 1, gl.DYNAMIC_DRAW, cloth.ao);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  grabMode = null;
+}
+function uploadCloth() {
+  cloth.computeNormals();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboPos); gl.bufferSubData(gl.ARRAY_BUFFER, 0, cloth.pos);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboNrm); gl.bufferSubData(gl.ARRAY_BUFFER, 0, cloth.nrm);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboAO);  gl.bufferSubData(gl.ARRAY_BUFFER, 0, cloth.ao);
+}
+
+/* --------------------------------------------------------------- texture */
+const tex = gl.createTexture();
+let imgW = 1, imgH = 1;
+let maskData = null, maskW = 0, maskH = 0;   // 클릭 판정/가장자리 계산용 알파 마스크
+
+function maskAlpha(u, v) {
+  if (!maskData) return 255;
+  const x = Math.min(maskW - 1, Math.max(0, Math.floor(u * maskW))), y = Math.min(maskH - 1, Math.max(0, Math.floor(v * maskH)));
+  return maskData[(y * maskW + x) * 4 + 3];
+}
+
+// 어떤 이미지든 캔버스를 거쳐 올림: 크기 제한 + 알파 프리멀티플라이 일관성 확보
+let baseCanvas = null;                       // 원본(배경 제거 전) 이미지
+function setTextureFrom(source) {
+  const sw = source.naturalWidth || source.width, sh = source.naturalHeight || source.height;
+  const sc = Math.min(1, 1024 / Math.max(sw, sh));   // 러그가 최대 500px이라 1024면 충분
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(sw * sc)); c.height = Math.max(1, Math.round(sh * sc));
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(source, 0, 0, c.width, c.height);
+  baseCanvas = c;
+  uploadTexture();
+}
+
+// 배경 제거: 가장자리 색을 배경으로 보고, 가장자리에서 이어진 비슷한 색 영역만 투명하게 만든다 (flood fill)
+function removeBackground(src, tol) {
+  const w = src.width, h = src.height;
+  const out = document.createElement('canvas'); out.width = w; out.height = h;
+  const og = out.getContext('2d', { willReadFrequently: true });
+  og.drawImage(src, 0, 0);
+  const img = og.getImageData(0, 0, w, h), d = img.data;
+  // 배경색 추정: 테두리 픽셀 색의 중앙값
+  const rs = [], gs = [], bs = [];
+  const sample = (x, y) => { const i = (y * w + x) * 4; if (d[i + 3] > 200) { rs.push(d[i]); gs.push(d[i + 1]); bs.push(d[i + 2]); } };
+  for (let x = 0; x < w; x += 3) { sample(x, 0); sample(x, h - 1); }
+  for (let y = 0; y < h; y += 3) { sample(0, y); sample(w - 1, y); }
+  if (!rs.length) return out;                      // 이미 가장자리가 투명한 PNG
+  const med = a => { a.sort((p, q) => p - q); return a[a.length >> 1]; };
+  const br = med(rs), bg = med(gs), bb = med(bs);
+  const lim = tol * tol * 3;                       // tol = RGB 한 채널 기준 허용 오차
+  const bgm = new Uint8Array(w * h);               // 1 = 배경
+  const stack = [];
+  const near = p => { const i = p * 4; if (d[i + 3] < 8) return true; const dr = d[i] - br, dg = d[i + 1] - bg, db = d[i + 2] - bb; return dr * dr + dg * dg + db * db <= lim; };
+  const push = p => { if (!bgm[p] && near(p)) { bgm[p] = 1; stack.push(p); } };
+  for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+  while (stack.length) {
+    const p = stack.pop(), x = p % w;
+    if (x > 0) push(p - 1);
+    if (x < w - 1) push(p + 1);
+    if (p >= w) push(p - w);
+    if (p < w * (h - 1)) push(p + w);
+  }
+  // 경계를 1px 부드럽게: 배경 이웃 비율만큼 알파를 깎는다 (3x3)
+  const a = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) { const yy = y + dy; if (yy < 0 || yy >= h) continue;
+      for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= w) continue; s += bgm[yy * w + xx]; n++; } }
+    a[y * w + x] = bgm[y * w + x] ? 0 : Math.max(0, 1 - (s / n) * 1.5);
+  }
+  for (let p = 0; p < w * h; p++) d[p * 4 + 3] = Math.round(d[p * 4 + 3] * a[p]);
+  og.putImageData(img, 0, 0);
+  return out;
+}
+
+function uploadTexture() {
+  const c = $('bgRemove') && $('bgRemove').checked ? removeBackground(baseCanvas, +$('bgTol').value) : baseCanvas;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  imgW = c.width; imgH = c.height;
+  const m = document.createElement('canvas');
+  const ms = Math.min(1, 256 / Math.max(imgW, imgH));
+  maskW = Math.max(1, Math.round(imgW * ms)); maskH = Math.max(1, Math.round(imgH * ms));
+  m.width = maskW; m.height = maskH;
+  const mg = m.getContext('2d', { willReadFrequently: true });
+  mg.drawImage(c, 0, 0, maskW, maskH);
+  maskData = mg.getImageData(0, 0, maskW, maskH).data;
+}
+
+function loadFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    $('bgRemove').checked = false;
+    setTextureFrom(img); URL.revokeObjectURL(url); layout(); buildCloth();
+    $('panel').classList.add('open');              // 배경 제거 옵션이 바로 보이게
+  };
+  img.onerror = () => alert('이미지를 읽을 수 없습니다.');
+  img.src = url;
+}
+
+/* ------------------------------------------------------------ layout/state */
+let dpr = 1, vw = 0, vh = 0;
+let rugW = 520, rugH = 325;
+let docX = 0, docY = 0;                   // 러그 로컬 (0,0)의 문서(페이지) 좌표 — 스크롤과 함께 움직인다
+let originX = 0, originY = 0;             // 현재 뷰포트 기준 원점 = doc - scroll
+const LIFT = 30;                          // 모서리를 들어 올리는 높이(px)
+let grabMode = null;                      // 'lift' | 'push' | 'move'
+let lastP = null, lastClient = null;
+const syncOrigin = () => { originX = docX - scrollX; originY = docY - scrollY; };
+
+// 처음 위치: PC는 본문 왼쪽, 모바일은 프로필 사진 바로 아래(사진을 가리지 않게)
+let touched = false;
+function placeInitial() {
+  if (innerWidth < 720) {
+    const ib = document.querySelector('.infobox').getBoundingClientRect();
+    docX = (innerWidth - rugW) / 2; docY = ib.bottom + scrollY + 24;
+  } else { docX = innerWidth * 0.36 - rugW / 2; docY = 400 - rugH / 2; }
+}
+addEventListener('load', () => { if (!touched && cloth) { placeInitial(); syncOrigin(); } });   // 사진이 로드되어 높이가 정해진 뒤 재배치
+
+function layout(first) {
+  wake();
+  if (first) $('size').value = 300;
+  const newW = Math.round(Math.min(+$('size').value, 500 * Math.min(1, imgW / imgH))), newH = newW * imgH / imgW;   // 긴 변도 300px 이하 (세로 사진이 렉 걸리지 않게)
+  const sizeChanged = !cloth || newW !== rugW || Math.abs(newH - rugH) > 0.5;
+  let cx = null, cy = null;
+  if (cloth && sizeChanged) { const c = cloth.centroid(); cx = docX + c.x; cy = docY + c.y; }   // 크기를 바꿔도 중심 유지
+  rugW = newW; rugH = newH;
+  vw = innerWidth; vh = innerHeight; dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(vw * dpr); canvas.height = Math.round(vh * dpr);
+  if (sizeChanged) {
+    if (cx !== null) { docX = cx - rugW / 2; docY = cy - rugH / 2; }
+    else placeInitial();
+    buildCloth();
+  }
+  syncOrigin();
+  $('vSize').textContent = rugW + 'px';
+  $('vStiff').textContent = $('stiff').value;
+}
+
+/* ----------------------------------------------------------------- input */
+// 러그는 페이지 위에 겹쳐진 캔버스라서 이벤트는 window에서 받고, 러그가 있는 곳만 가로챈다.
+const local = e => ({ x: e.clientX - originX, y: e.clientY - originY });
+const isUI = t => !!(t && t.closest && t.closest('#panel,#bar'));
+const reach = e => (e.pointerType === 'touch' ? 16 : 0);       // 손가락은 잡는 범위를 넉넉하게
+let swallow = false, swallowTimer = 0;
+
+window.addEventListener('pointerdown', e => {
+  if (isUI(e.target) || e.button === 1) return;
+  syncOrigin();
+  const p = local(e), idx = cloth.pick(p.x, p.y, reach(e));
+  if (idx < 0) return;
+  e.preventDefault(); swallow = true; touched = true; clearTimeout(swallowTimer);
+  lastClient = { x: e.clientX, y: e.clientY };
+  if (e.button === 2 || e.altKey || $('moveMode').checked) { grabMode = 'move'; lastP = p; }
+  else {
+    // 가장자리거나, 이미 접혀서 위에 올라가 있는 천이면 들어서 옮긴다 (아래 천을 뚫고 끌리지 않게)
+    grabMode = (cloth.edge[idx] || cloth.pos[3 * idx + 2] > 1.5 * cloth.d) ? 'lift' : 'push';
+    cloth.grab(idx, p.x, p.y, grabMode === 'lift' ? LIFT : 0, grabMode === 'lift' ? 2.5 : 3.5);
+  }
+  document.body.classList.add('dragging');
+  try { document.documentElement.setPointerCapture(e.pointerId); } catch (_) {}
+}, true);
+
+function applyDrag() {
+  if (!grabMode || !lastClient) return;
+  syncOrigin();
+  const p = { x: lastClient.x - originX, y: lastClient.y - originY };
+  if (grabMode === 'move') { cloth.translate(p.x - lastP.x, p.y - lastP.y); lastP = p; }
+  else cloth.dragTo(p.x, p.y);
+}
+window.addEventListener('pointermove', e => {
+  lastClient = { x: e.clientX, y: e.clientY };
+  if (grabMode) { applyDrag(); return; }
+  if (e.pointerType !== 'mouse') return;
+  const cl = document.body.classList; cl.remove('rug-grab', 'rug-move');
+  if (isUI(e.target)) return;
+  syncOrigin(); const p = local(e), idx = cloth.pick(p.x, p.y);
+  if (idx >= 0) cl.add(cloth.edge[idx] ? 'rug-grab' : 'rug-move');
+});
+window.addEventListener('scroll', () => { syncOrigin(); applyDrag(); }, { passive: true });
+function release() {
+  if (!grabMode) return;
+  cloth.release(); grabMode = null; wake(3500); savePosSoon(); document.body.classList.remove('dragging');
+  swallowTimer = setTimeout(() => { swallow = false; }, 150);
+}
+window.addEventListener('pointerup', release, true);
+window.addEventListener('pointercancel', release, true);
+window.addEventListener('click', e => { if (swallow) { e.preventDefault(); e.stopPropagation(); } }, true);
+window.addEventListener('contextmenu', e => {
+  if (swallow || isUI(e.target)) { if (swallow) e.preventDefault(); return; }
+  syncOrigin(); const p = local(e); if (cloth.pick(p.x, p.y) >= 0) e.preventDefault();
+});
+window.addEventListener('dblclick', e => { if (isUI(e.target)) return; syncOrigin(); const p = local(e); if (cloth.pick(p.x, p.y) >= 0) (cloth.flatten(), wake(3500)); });
+
+// 터치: 러그를 잡을 때는 페이지가 스크롤되지 않게 막는다
+window.addEventListener('touchstart', e => {
+  if (isUI(e.target)) return;
+  syncOrigin(); const t = e.touches[0];
+  if (cloth.pick(t.clientX - originX, t.clientY - originY, 16) >= 0) e.preventDefault();
+}, { passive: false });
+window.addEventListener('touchmove', e => { if (grabMode) e.preventDefault(); }, { passive: false });
+
+$('fab').onclick = () => $('panel').classList.toggle('open');
+let toastTimer = 0;
+const toast = msg => { const t = $('toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2200); };
+$('share').onclick = async () => {
+  const url = location.origin + location.pathname;
+  if (navigator.share) { try { await navigator.share({ title: document.title, text: '하늘위키 - 최현우 문서', url }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+  try { await navigator.clipboard.writeText(url); }
+  catch (_) { const ta = document.createElement('textarea'); ta.value = url; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch (__) {} ta.remove(); }
+  toast('링크를 복사했습니다');
+};
+$('btnClose').onclick = () => $('panel').classList.remove('open');
+$('btnOpen').onclick = () => $('file').click();
+$('file').onchange = e => { loadFile(e.target.files[0]); e.target.value = ''; };
+$('btnDefault').onclick = () => { $('bgRemove').checked = false; loadDefaultRug(); };
+$('btnFlat').onclick = () => { release(); (cloth.flatten(), wake(3500)); };
+let bgTimer = 0;
+const applyBg = () => {
+  $('vTol').textContent = $('bgTol').value;
+  clearTimeout(bgTimer);
+  bgTimer = setTimeout(() => { release(); uploadTexture(); layout(); buildCloth(); }, 120);
+};
+$('bgRemove').addEventListener('change', applyBg);
+$('bgTol').addEventListener('input', () => { if ($('bgRemove').checked) applyBg(); else $('vTol').textContent = $('bgTol').value; });
+$('vTol').textContent = $('bgTol').value;
+$('size').addEventListener('input', () => layout());
+$('stiff').addEventListener('input', () => { $('vStiff').textContent = $('stiff').value; cloth.setBend(+$('stiff').value / 100); });
+addEventListener('resize', () => layout());
+
+addEventListener('dragover', e => { e.preventDefault(); $('drop').style.display = 'flex'; });
+addEventListener('dragleave', e => { if (!e.relatedTarget) $('drop').style.display = 'none'; });
+addEventListener('drop', e => { e.preventDefault(); $('drop').style.display = 'none'; loadFile(e.dataTransfer.files[0]); });
+addEventListener('paste', e => { for (const it of e.clipboardData.items) if (it.type.startsWith('image/')) { loadFile(it.getAsFile()); break; } });
+
+/* ---------------------------------------------------------------- render */
+let last = performance.now(), acc = 0;
+const STEP = 1 / 60;
+const TAPS = [[0, 0], [5, 0], [-5, 0], [0, 5], [0, -5], [3.5, 3.5], [-3.5, -3.5], [3.5, -3.5], [-3.5, 3.5]];
+function frame(now) {
+  if (!grabMode && now > wakeUntil) { last = now; acc = 0; requestAnimationFrame(frame); return; }
+  syncOrigin();
+  acc += Math.min(0.1, (now - last) / 1000); last = now;
+  for (let i = 0; acc >= STEP && i < 4; i++, acc -= STEP) cloth.step(STEP);
+  if (acc > STEP) acc = 0;
+  uploadCloth();
+  updateShape();
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(prog); gl.bindVertexArray(vao);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(U.u_tex, 0);
+  gl.uniform2f(U.u_origin, originX, originY); gl.uniform2f(U.u_view, vw, vh);
+  gl.uniform1f(U.u_backDark, 0.8);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+  // 1) 그림자: 여러 번 살짝 어긋나게 그려서 부드럽게
+  gl.disable(gl.DEPTH_TEST); gl.uniform1f(U.u_pass, 0); gl.uniform1f(U.u_shadowA, 0.07);
+  for (const t of TAPS) { gl.uniform2f(U.u_tap, t[0], t[1]); gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_INT, 0); }
+  // 2) 러그
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.uniform1f(U.u_pass, 1);
+  gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_INT, 0);
+  requestAnimationFrame(frame);
+}
+
+/* ------------------------------------------------------------------ boot */
+// 기본 러그: 줄무늬 도안 (rug-default.js의 data URL). 불러오는 동안은 투명 1x1로 시작한다.
+function loadDefaultRug() {
+  const img = new Image();
+  img.onload = () => { setTextureFrom(img); layout(); buildCloth(); if (!touched) { placeInitial(); syncOrigin(); } };
+  img.src = DEFAULT_RUG_URL;
+}
+setTextureFrom(document.createElement('canvas'));
+layout(true);
+
+
+/* ---------------------------------------------------- 데스크톱(Electron) 연동 */
+placeInitial = function () { docX = (innerWidth - rugW) / 2; docY = (innerHeight - rugH) / 2; };
+
+function loadRugUrl(url) {
+  const img = new Image();
+  img.onload = () => {
+    setTextureFrom(img); layout(); buildCloth();
+    if (!touched) { placeInitial(); syncOrigin(); }
+    wake();
+  };
+  img.onerror = () => deskApi.log('이미지를 읽지 못했습니다');
+  img.src = url || DEFAULT_RUG_URL;
+}
+
+// 창의 입력 영역을 러그의 바운딩 박스로 한정한다 (setShape). 박스 밖은 클릭이 바탕화면/뒤의 창으로 그대로 통과한다.
+let lastShape = '';
+function updateShape() {
+  if (!cloth) return;
+  const P = cloth.pos, A = cloth.alpha;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (let i = 0; i < cloth.n; i++) {
+    if (A[i] < 24) continue;
+    const z = P[3 * i + 2], x = P[3 * i] + 0.12 * z, y = P[3 * i + 1] - 0.45 * z;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  let r;
+  if (x1 < x0) r = { x: 0, y: 0, width: 1, height: 1 };
+  else {
+    const m = 56;   // 그림자와 잡기 여유
+    const L = Math.max(0, Math.floor(originX + x0 - m)), T = Math.max(0, Math.floor(originY + y0 - m));
+    const R = Math.min(innerWidth, Math.ceil(originX + x1 + m)), B = Math.min(innerHeight, Math.ceil(originY + y1 + m));
+    r = { x: L, y: T, width: Math.max(1, R - L), height: Math.max(1, B - T) };
+  }
+  const key = r.x + ',' + r.y + ',' + r.width + ',' + r.height;
+  if (key !== lastShape) { lastShape = key; deskApi.setShape(r); }
+}
+
+let posTimer = 0;
+function savePosSoon() {
+  clearTimeout(posTimer);
+  posTimer = setTimeout(() => { const c = cloth.centroid(); deskApi.savePos(Math.round(docX + c.x), Math.round(docY + c.y)); }, 3600);
+}
+function setSize(v) { $('size').value = v; layout(); wake(); }
+
+deskApi.onCommand(msg => {
+  switch (msg.type) {
+    case 'init': {
+      const s = msg.settings;
+      $('stiff').value = s.stiff; $('bgTol').value = s.tol; $('bgRemove').checked = !!s.bg; $('vTol').textContent = s.tol;
+      $('size').value = s.size; layout();
+      if (s.pos) {
+        touched = true;
+        docX = Math.min(Math.max(s.pos.x, 0), innerWidth) - rugW / 2;
+        docY = Math.min(Math.max(s.pos.y, 0), innerHeight) - rugH / 2;
+        syncOrigin();
+      }
+      loadRugUrl(msg.image);
+      break;
+    }
+    case 'image': loadRugUrl(msg.url); break;
+    case 'size': setSize(msg.value); break;
+    case 'stiff': $('stiff').value = msg.value; $('stiff').dispatchEvent(new Event('input')); wake(); break;
+    case 'bg': $('bgRemove').checked = msg.on; $('bgTol').value = msg.tol; applyBg(); break;
+    case 'flatten': release(); cloth.flatten(); wake(3500); break;
+    case 'center': {
+      const c = cloth.centroid(); cloth.translate(innerWidth / 2 - (docX + c.x), innerHeight / 2 - (docY + c.y)); wake(); savePosSoon(); break;
+    }
+  }
+});
+deskApi.ready();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
